@@ -332,6 +332,46 @@ async def process_batch(
         )
 
 
+@router.post("/{project_id}/batch/{batch_id}/finish/", tags=["Image Classification"])
+async def finish_batch(
+    project_id: UUID,
+    batch_id: UUID,
+    redis: Annotated[ArqRedis, Depends(get_redis_pool)],
+    user: Annotated[AuthUser, Depends(login_required)],
+):
+    """Finish batch: organize images in S3 regardless of processing.
+
+    This endpoint:
+    1. Moves assigned images from user-uploads to their task folders in S3
+    2. Does NOT require tasks to be marked as IMAGE_UPLOADED
+    3. Is idempotent: safe to call multiple times
+
+    """
+    try:
+        # Enqueue the organization job to run in background
+        job = await redis.enqueue_job(
+            "organize_batch_images",
+            str(project_id),
+            str(batch_id),
+            _queue_name="default_queue",
+        )
+
+        log.info(f"Queued batch organization job: {job.job_id} for batch: {batch_id}")
+
+        return {
+            "message": "Batch finishing: organizing images in S3",
+            "job_id": job.job_id,
+            "batch_id": str(batch_id),
+        }
+
+    except Exception as e:
+        log.error(f"Failed to queue batch finish job: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"Failed to finish batch: {e}",
+        )
+
+
 @router.get(
     "/{project_id}/batch/{batch_id}/task/{task_id}/verification/",
     tags=["Image Classification"],

@@ -499,7 +499,20 @@ async def process_batch_images(
 
     try:
         async with db_pool.connection() as conn:
-            # Step 1: Move images to task folders
+            # Step 0: Safety check - organize any unorganized assigned images first
+            # This is idempotent and handles cases where finish wasn't called
+            log.info(f"Pre-processing: ensuring all assigned images are organized...")
+            _organize_result = await ImageClassifier.organize_batch_images_in_s3(
+                conn, UUID(batch_id), UUID(project_id)
+            )
+            await conn.commit()
+
+            if _organize_result["total_moved"] > 0:
+                log.info(
+                    f"Pre-organized {_organize_result['total_moved']} images during processing"
+                )
+
+            # Step 1: Move images to task folders (for IMAGE_UPLOADED tasks)
             log.info(f"Moving batch {batch_id} images to task folders...")
             move_result = await ImageClassifier.move_batch_images_to_tasks(
                 conn, UUID(batch_id), UUID(project_id)
@@ -593,6 +606,63 @@ async def process_batch_images(
 
     except Exception as e:
         log.error(f"Failed to process batch (Job: {job_id}): {str(e)}")
+        raise
+
+
+async def organize_batch_images(
+    ctx: Dict[Any, Any],
+    project_id: str,
+    batch_id: str,
+) -> Dict[str, Any]:
+    """Background task to organize batch images in S3.
+
+    This task moves assigned images from user-uploads to their task folders.
+    Unlike process_batch_images, this does NOT require tasks to be IMAGE_UPLOADED
+    or trigger ODM processing. It's called when users finish the batch without
+    immediately processing.
+
+    This addresses issue #713 by ensuring images are organized even if processing
+    is deferred.
+
+    Args:
+        ctx: ARQ context
+        project_id: UUID of the project
+        batch_id: UUID of the batch to organize
+
+    Returns:
+        dict: Organization result
+    """
+    job_id = ctx.get("job_id", "unknown")
+    log.info(f"Starting organize_batch_images (Job ID: {job_id}): batch={batch_id}")
+
+    db_pool = ctx.get("db_pool")
+    if not db_pool:
+        raise RuntimeError("Database pool not initialized in ARQ context")
+
+    try:
+        async with db_pool.connection() as conn:
+            # Organize images to task folders
+            log.info(f"Organizing batch {batch_id} images to task folders...")
+            organize_result = await ImageClassifier.organize_batch_images_in_s3(
+                conn, UUID(batch_id), UUID(project_id)
+            )
+            await conn.commit()
+
+            log.info(
+                f"Organized {organize_result['total_moved']} images to "
+                f"{organize_result['task_count']} tasks "
+                f"({organize_result['total_skipped']} already in place, "
+                f"{organize_result['total_failed']} failed)"
+            )
+
+            return {
+                "message": "Batch images organized",
+                "batch_id": batch_id,
+                "organize_result": organize_result,
+            }
+
+    except Exception as e:
+        log.error(f"Failed to organize batch (Job: {job_id}): {str(e)}")
         raise
 
 

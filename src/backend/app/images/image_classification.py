@@ -1127,6 +1127,137 @@ class ImageClassifier:
         }
 
     @staticmethod
+    async def organize_batch_images_in_s3(
+        db: Connection,
+        batch_id: uuid.UUID,
+        project_id: uuid.UUID,
+    ) -> dict:
+        """Move assigned images to task folders in S3.
+
+        Moves all assigned images from staging (user-uploads) to their task folders.
+        Works independently of task state (doesn't require IMAGE_UPLOADED).
+
+        Uses row-level database locking to ensure concurrent calls don't duplicate moves.
+        Idempotent: multiple calls safely skip already-organized images.
+
+        Args:
+            db: Database connection
+            batch_id: Batch to organize
+            project_id: Project ID
+
+        Returns:
+            dict: Count of moved/skipped/failed images grouped by task
+        """
+        query = """
+            SELECT pi.id, pi.filename, pi.s3_key, pi.task_id
+            FROM project_images pi
+            WHERE pi.batch_id = %(batch_id)s
+            AND pi.project_id = %(project_id)s
+            AND pi.status = %(status)s
+            AND pi.task_id IS NOT NULL
+            ORDER BY pi.task_id, pi.uploaded_at
+            FOR UPDATE OF pi
+        """
+
+        try:
+            async with db.transaction():
+                async with db.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        query,
+                        {
+                            "batch_id": str(batch_id),
+                            "project_id": str(project_id),
+                            "status": ImageStatus.ASSIGNED.value,
+                        },
+                    )
+                    images = await cur.fetchall()
+
+                if not images:
+                    return {
+                        "batch_id": str(batch_id),
+                        "message": "No assigned images to organize",
+                        "total_moved": 0,
+                        "total_skipped": 0,
+                        "total_failed": 0,
+                        "task_count": 0,
+                        "tasks": {},
+                    }
+
+                tasks_summary = {}
+                moved_count = 0
+                skipped_count = 0
+                failed_count = 0
+
+                for image in images:
+                    task_id = str(image["task_id"])
+                    filename = image["filename"]
+                    source_key = image["s3_key"]
+                    dest_key = f"projects/{project_id}/{task_id}/images/{filename}"
+
+                    # Already organized - skip
+                    if source_key == dest_key:
+                        log.debug(f"Image {filename} already in task folder")
+                        skipped_count += 1
+                        if task_id not in tasks_summary:
+                            tasks_summary[task_id] = {
+                                "task_id": task_id,
+                                "moved_count": 0,
+                                "skipped_count": 0,
+                                "images": [],
+                            }
+                        tasks_summary[task_id]["skipped_count"] += 1
+                        tasks_summary[task_id]["images"].append(filename)
+                        continue
+
+                    # Copy to task folder
+                    success = await run_in_threadpool(
+                        copy_file_within_bucket,
+                        settings.S3_BUCKET_NAME,
+                        source_key,
+                        dest_key,
+                    )
+
+                    if success:
+                        async with db.cursor() as update_cur:
+                            await update_cur.execute(
+                                "UPDATE project_images SET s3_key = %(key)s WHERE id = %(id)s",
+                                {"key": dest_key, "id": str(image["id"])},
+                            )
+
+                        moved_count += 1
+                        if task_id not in tasks_summary:
+                            tasks_summary[task_id] = {
+                                "task_id": task_id,
+                                "moved_count": 0,
+                                "skipped_count": 0,
+                                "images": [],
+                            }
+                        tasks_summary[task_id]["moved_count"] += 1
+                        tasks_summary[task_id]["images"].append(filename)
+                        log.info(f"Organized {filename} to task {task_id}")
+                    else:
+                        failed_count += 1
+                        log.error(f"Failed to organize {filename} for task {task_id}")
+
+                log.info(
+                    f"Batch {batch_id}: {moved_count} moved, {skipped_count} skipped, "
+                    f"{failed_count} failed across {len(tasks_summary)} tasks"
+                )
+
+                return {
+                    "batch_id": str(batch_id),
+                    "total_moved": moved_count,
+                    "total_skipped": skipped_count,
+                    "total_failed": failed_count,
+                    "task_count": len(tasks_summary),
+                    "tasks": tasks_summary,
+                }
+
+        except Exception as e:
+            log.error(f"Batch {batch_id}: Organization failed: {e}")
+            raise
+
+    @staticmethod
     async def move_batch_images_to_tasks(
         db: Connection,
         batch_id: uuid.UUID,
