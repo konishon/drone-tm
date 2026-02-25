@@ -511,8 +511,6 @@ async def process_batch_images(
                 log.info(
                     f"Pre-organized {_organize_result['total_moved']} images during processing"
                 )
-
-            # Step 1: Move images to task folders (for IMAGE_UPLOADED tasks)
             log.info(f"Moving batch {batch_id} images to task folders...")
             move_result = await ImageClassifier.move_batch_images_to_tasks(
                 conn, UUID(batch_id), UUID(project_id)
@@ -621,8 +619,6 @@ async def organize_batch_images(
     or trigger ODM processing. It's called when users finish the batch without
     immediately processing.
 
-    This addresses issue #713 by ensuring images are organized even if processing
-    is deferred.
 
     Args:
         ctx: ARQ context
